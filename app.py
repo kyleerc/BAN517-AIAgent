@@ -111,6 +111,126 @@ def render_dropdown_decision_report(response, default_expanded: bool = False):
             st.markdown(body)
 
 
+def render_csv_data_analysis(uploaded_file):
+    import pandas as pd
+    import streamlit as st
+
+    st.markdown("---")
+    st.header("📊 Inventory Data Analysis")
+
+    try:
+        df = pd.read_csv(uploaded_file)
+    except Exception as e:
+        st.error(f"Error reading CSV file: {e}")
+        return
+
+    # Validate required columns
+    required_columns = ["Product", "Category", "Units", "Unit Cost"]
+    missing_columns = [col for col in required_columns if col not in df.columns]
+
+    if missing_columns:
+        st.error(f"⚠️ Missing required column(s) in uploaded CSV: **{', '.join(missing_columns)}**")
+        st.info(f"Required columns are: {', '.join(required_columns)}")
+        st.caption("Uploaded Columns: " + ", ".join(list(df.columns)))
+        st.dataframe(df, use_container_width=True)
+        return
+
+    # Clean numeric columns if strings contain currency symbols or commas
+    if df["Units"].dtype == object:
+        df["Units"] = pd.to_numeric(df["Units"].astype(str).str.replace(",", "", regex=False), errors="coerce")
+    else:
+        df["Units"] = pd.to_numeric(df["Units"], errors="coerce")
+
+    if df["Unit Cost"].dtype == object:
+        df["Unit Cost"] = pd.to_numeric(
+            df["Unit Cost"].astype(str).str.replace("$", "", regex=False).str.replace(",", "", regex=False),
+            errors="coerce",
+        )
+    else:
+        df["Unit Cost"] = pd.to_numeric(df["Unit Cost"], errors="coerce")
+
+    # Step 5: Display number of rows, number of columns, column names
+    num_rows = len(df)
+    num_cols = len(df.columns)
+    col_names_str = ", ".join(df.columns.tolist())
+
+    col_meta1, col_meta2, col_meta3 = st.columns(3)
+    with col_meta1:
+        st.metric("Number of Rows", f"{num_rows:,}")
+    with col_meta2:
+        st.metric("Number of Columns", f"{num_cols}")
+    with col_meta3:
+        st.markdown(f"**Column Names:**\n`{col_names_str}`")
+
+    # DATA ANALYSIS Using pandas
+    # 1. Total Units
+    total_units = df["Units"].sum()
+
+    # 2. Average Unit Cost
+    avg_unit_cost = df["Unit Cost"].mean()
+
+    # 3. Product with highest Units
+    if not df.empty and df["Units"].notna().any():
+        highest_units_idx = df["Units"].idxmax()
+        highest_product = df.loc[highest_units_idx, "Product"]
+        highest_units_val = df.loc[highest_units_idx, "Units"]
+    else:
+        highest_product = "N/A"
+        highest_units_val = 0
+
+    # 4. Group data by Category and calculate total Units for each Category
+    category_units = df.groupby("Category")["Units"].sum().reset_index()
+
+    # 5. Create new calculated column: Inventory Value = Units × Unit Cost
+    df["Inventory Value"] = df["Units"] * df["Unit Cost"]
+
+    # 6. Calculate total Inventory Value across all products
+    total_inventory_value = df["Inventory Value"].sum()
+
+    # RESULTS display
+    st.subheader("📈 Summary Metrics")
+    m1, m2, m3, m4 = st.columns(4)
+    with m1:
+        st.metric("Total Units", f"{total_units:,.0f}")
+    with m2:
+        st.metric("Average Unit Cost", f"${avg_unit_cost:,.2f}")
+    with m3:
+        st.metric(
+            "Product with Highest Units",
+            f"{highest_product}",
+            delta=f"{highest_units_val:,.0f} units" if highest_product != "N/A" else None,
+        )
+    with m4:
+        st.metric("Total Inventory Value", f"${total_inventory_value:,.2f}")
+
+    # Total Units by Category
+    st.subheader("📂 Total Units by Category")
+    c_col1, c_col2 = st.columns([1, 1])
+    with c_col1:
+        st.dataframe(
+            category_units,
+            column_config={
+                "Units": st.column_config.NumberColumn("Total Units", format="%d")
+            },
+            use_container_width=True,
+            hide_index=True,
+        )
+    with c_col2:
+        st.bar_chart(category_units.set_index("Category")["Units"])
+
+    # Display the dataframe including the new Inventory Value column
+    st.subheader("📋 Inventory Data Table (with Inventory Value)")
+    st.dataframe(
+        df,
+        column_config={
+            "Unit Cost": st.column_config.NumberColumn("Unit Cost", format="$%.2f"),
+            "Inventory Value": st.column_config.NumberColumn("Inventory Value", format="$%.2f"),
+            "Units": st.column_config.NumberColumn("Units", format="%d"),
+        },
+        use_container_width=True,
+    )
+
+
 def run_streamlit_app():
     import streamlit as st
 
@@ -151,6 +271,18 @@ def run_streamlit_app():
                - Single-period critical fractile ($C_u / (C_u + C_o)$)
             """
         )
+
+        st.markdown("---")
+        st.header("📁 Data Upload")
+        uploaded_file = st.file_uploader(
+            "Upload CSV File",
+            type=["csv"],
+            help="Upload an inventory CSV file with Product, Category, Units, and Unit Cost columns.",
+        )
+
+    # Optional CSV Data Analysis View
+    if uploaded_file is not None:
+        render_csv_data_analysis(uploaded_file)
 
     # Input question container
     if selected_scenario_label != "Custom Question":
