@@ -1534,54 +1534,50 @@ def classify_inventory_multicriteria(
     if thresholds is None:
         thresholds = {"A": 0.60, "B": 0.80, "C": 0.90, "D": 1.00}
 
-    def assign_tier(val: float, prev_pct: float) -> str:
+    def assign_tier(cum_pct: float, val: float, rank_idx: int) -> str:
         if val <= 0:
             return "D"
-        if prev_pct < thresholds["A"]:
+        if rank_idx == 0 or cum_pct <= thresholds["A"]:
             return "A"
-        elif prev_pct < thresholds["B"]:
+        elif cum_pct <= thresholds["B"]:
             return "B"
-        elif prev_pct < thresholds["C"]:
+        elif cum_pct <= thresholds["C"]:
             return "C"
         else:
             return "D"
 
-    # Step 1a: Sales Classification (Pareto Cumulative Distribution)
-    sales_sorted = res_df.sort_values(by="_sales_clean", ascending=False).copy()
+    # Step 1a: Sales Classification (Pareto Cumulative Distribution: 0-60% A, 61-80% B, 81-90% C, 91-100% D)
+    sales_sorted = res_df.sort_values(by="_sales_clean", ascending=False).reset_index().copy()
     tot_sales = sales_sorted["_sales_clean"].sum()
     cum_sales = sales_sorted["_sales_clean"].cumsum()
-    prev_cum_sales = cum_sales.shift(1, fill_value=0.0)
     div_sales = tot_sales if tot_sales > 0 else 1.0
-
-    sales_sorted["Sales Cumulative %"] = (cum_sales / div_sales) * 100.0
-    prev_cum_sales_pct = prev_cum_sales / div_sales
+    sales_sorted["_cum_pct"] = cum_sales / div_sales
+    sales_sorted["Sales Cumulative %"] = (sales_sorted["_cum_pct"] * 100.0).round(2)
 
     sales_sorted["Sales Class"] = [
-        assign_tier(v, p) for v, p in zip(sales_sorted["_sales_clean"], prev_cum_sales_pct)
+        assign_tier(p, v, i) for i, (p, v) in enumerate(zip(sales_sorted["_cum_pct"], sales_sorted["_sales_clean"]))
     ]
 
-    # Step 1b: POS Hits Classification (Velocity Cumulative Distribution)
-    hits_sorted = res_df.sort_values(by="_hits_clean", ascending=False).copy()
+    # Step 1b: POS Hits Classification (Velocity Cumulative Distribution: 0-60% A, 61-80% B, 81-90% C, 91-100% D)
+    hits_sorted = res_df.sort_values(by="_hits_clean", ascending=False).reset_index().copy()
     tot_hits = hits_sorted["_hits_clean"].sum()
     cum_hits = hits_sorted["_hits_clean"].cumsum()
-    prev_cum_hits = cum_hits.shift(1, fill_value=0.0)
     div_hits = tot_hits if tot_hits > 0 else 1.0
-
-    hits_sorted["Hits Cumulative %"] = (cum_hits / div_hits) * 100.0
-    prev_cum_hits_pct = prev_cum_hits / div_hits
+    hits_sorted["_cum_pct"] = cum_hits / div_hits
+    hits_sorted["Hits Cumulative %"] = (hits_sorted["_cum_pct"] * 100.0).round(2)
 
     hits_sorted["Hits Class"] = [
-        assign_tier(v, p) for v, p in zip(hits_sorted["_hits_clean"], prev_cum_hits_pct)
+        assign_tier(p, v, i) for i, (p, v) in enumerate(zip(hits_sorted["_cum_pct"], hits_sorted["_hits_clean"]))
     ]
 
     # Realign sorted series to original DataFrame index
-    res_df["Sales Cumulative %"] = sales_sorted["Sales Cumulative %"].round(2)
-    res_df["Sales Class"] = sales_sorted["Sales Class"]
-    res_df["Hits Cumulative %"] = hits_sorted["Hits Cumulative %"].round(2)
-    res_df["Hits Class"] = hits_sorted["Hits Class"]
+    sales_indexed = sales_sorted.set_index("index")
+    hits_indexed = hits_sorted.set_index("index")
 
-    # Bi-Criteria Matrix Code (Sales-Hits)
-    res_df["Matrix (Sales-Hits)"] = res_df["Sales Class"] + "-" + res_df["Hits Class"]
+    res_df["Sales Cumulative %"] = sales_indexed["Sales Cumulative %"]
+    res_df["Sales Class"] = sales_indexed["Sales Class"]
+    res_df["Hits Cumulative %"] = hits_indexed["Hits Cumulative %"]
+    res_df["Hits Class"] = hits_indexed["Hits Class"]
 
     # Step 1c: Numerical Score Conversion: A = 4, B = 3, C = 2, D = 1
     score_map = {"A": 4, "B": 3, "C": 2, "D": 1}
@@ -1593,11 +1589,11 @@ def classify_inventory_multicriteria(
         sales_weight * res_df["Sales Score"] + hits_weight * res_df["Hits Score"]
     ).round(2)
 
-    # Step 3: Assign Final Inventory Class:
-    # A: 4.00 - 3.25
-    # B: 3.24 - 2.50
-    # C: 2.49 - 1.75
-    # D: < 1.75
+    # Step 3: Assign Final Inventory Class based ONLY on Combined Weighted Score:
+    # Class A: 3.25 - 4.00
+    # Class B: 2.50 - 3.24
+    # Class C: 1.75 - 2.49
+    # Class D: < 1.75
     def map_final_class(score: float) -> str:
         if score >= 3.25:
             return "A"
@@ -1608,7 +1604,8 @@ def classify_inventory_multicriteria(
         else:
             return "D"
 
-    res_df["Class"] = res_df["Combined Weighted Score"].apply(map_final_class)
+    res_df["Final Inventory Class"] = res_df["Combined Weighted Score"].apply(map_final_class)
+    res_df["Class"] = res_df["Final Inventory Class"]
 
     # Clean temporary calculation columns
     res_df = res_df.drop(columns=["_sales_clean", "_hits_clean"])
