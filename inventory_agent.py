@@ -249,15 +249,32 @@ class InventoryDecisionAgent:
 
     def _identify_model(self, question: str) -> Tuple[ModelType, str]:
         q = question.lower()
+        q_clean = re.sub(r"(?<=\d),(?=\d)", "", question)
 
         # 1. Quantity Discount
+        # Trigger A: Multiple price tiers / brackets extracted directly from question (e.g. different unit costs for amounts ordered)
+        extracted_tiers = self._extract_tiers(q_clean)
+        if len(extracted_tiers) >= 2:
+            return ModelType.QUANTITY_DISCOUNT, "Detected multiple quantity/pricing tiers with different unit costs for amount ordered."
+
+        # Trigger B: Explicit quantity discount / price-break / different unit costs terminology
         qd_keywords = [
             "discount", "price break", "volume discount", "quantity discount",
-            "tier", "tiers", "bracket", "bulk discount", "all-units discount",
-            "quantity break", "price schedule", "order quantity break"
+            "tier", "tiers", "bracket", "brackets", "bulk discount", "all-units discount",
+            "quantity break", "price schedule", "order quantity break", "different unit costs",
+            "different unit prices", "different prices", "unit cost depends", "unit price depends",
+            "unit cost for amount ordered", "unit price for amount ordered", "volume pricing"
         ]
-        if any(k in q for k in qd_keywords) and ("tier" in q or "price" in q or "$" in q or "cost" in q or "break" in q or "unit" in q or "schedule" in q):
-            return ModelType.QUANTITY_DISCOUNT, "Detected quantity discount / price-break terminology."
+        if any(k in q for k in qd_keywords) and ("tier" in q or "price" in q or "$" in q or "cost" in q or "break" in q or "unit" in q or "schedule" in q or "order" in q):
+            return ModelType.QUANTITY_DISCOUNT, "Detected quantity discount / price-break / different unit cost terminology."
+
+        # Trigger C: Phrasings giving unit costs for amounts ordered (e.g., "charges $... for orders below ...", "orders of ... or more")
+        qd_order_phrases = [
+            "for orders below", "for orders under", "for orders of less than", "orders below", "orders under",
+            "or more units", "units or more", "for orders of", "for orders above", "per unit for orders", "charges"
+        ]
+        if any(p in q for p in qd_order_phrases) and ("$" in q or "unit cost" in q or "per unit" in q or "price" in q) and ("below" in q or "under" in q or "or more" in q or "-" in q or "to" in q):
+            return ModelType.QUANTITY_DISCOUNT, "Detected different unit costs for amount ordered (quantity discount structure)."
 
         # 2. Fixed-Period Review (Periodic Review)
         fpr_keywords = [
@@ -908,63 +925,121 @@ class InventoryDecisionAgent:
         return None
 
     def _extract_tiers(self, text: str) -> List[Dict[str, Any]]:
-        """Extract multi-tier discount schedules from text."""
+        """Extract multi-tier discount schedules from text with comprehensive natural-language support."""
+        cleaned = re.sub(r"(?<=\d),(?=\d)", "", text)
         tiers: List[Dict[str, Any]] = []
 
-        # Pattern 1: e.g. "1-999 units @ $5.00" or "1 to 999 units the unit price is $5.00"
-        p1 = re.findall(
+        # ---------------------------------------------------------------------
+        # Format 1: Price-First Patterns
+        # e.g., "$12 per unit for orders below 500 units, $11.50 for 500-999 units, and $11 for orders of 1,000 units or more"
+        # ---------------------------------------------------------------------
+
+        # 1a. Price first, range: "$11.50 [per unit] for [orders of] 500-999 [units]"
+        p_range_price_first = re.findall(
+            r"\$([0-9]+(?:\.[0-9]+)?)(?:\s*(?:dollars?|per\s*unit|/unit|each))*\s+(?:for|at)\s+(?:orders?\s*(?:of)?\s*)?(?:between\s*)?([0-9]+)\s*(?:-|to|and)\s*([0-9]+)\s*(?:units?)?",
+            cleaned,
+            re.IGNORECASE,
+        )
+        for price, q1, q2 in p_range_price_first:
+            tiers.append({"min_qty": float(q1), "max_qty": float(q2), "unit_price": float(price)})
+
+        # 1b. Price first, upper-bounded: "$12 [per unit] for [orders] below/under/less than/fewer than/up to 500 [units]"
+        p_below_price_first = re.findall(
+            r"\$([0-9]+(?:\.[0-9]+)?)(?:\s*(?:dollars?|per\s*unit|/unit|each))*\s*(?:for|at)?\s*(?:orders?\s*(?:of)?\s*)?(?:below|under|less\s*than|fewer\s*than|up\s*to|<)\s*([0-9]+)\s*(?:units?)?",
+            cleaned,
+            re.IGNORECASE,
+        )
+        for price, upper in p_below_price_first:
+            val = float(upper)
+            m_phrase = re.search(r"(below|under|less|fewer|<)\s*" + upper, cleaned, re.IGNORECASE)
+            max_q = (val - 1.0) if m_phrase else val
+            tiers.append({"min_qty": 1.0, "max_qty": max_q, "unit_price": float(price)})
+
+        # 1c. Price first, open-ended: "$11 [per unit] for [orders of] 1000 units or more"
+        p_above_price_first = re.findall(
+            r"\$([0-9]+(?:\.[0-9]+)?)(?:\s*(?:dollars?|per\s*unit|/unit|each))*\s+(?:for|at)\s+(?:orders?\s*(?:of)?\s*)?(?:(?:above|over|exceeding|>=?)\s*([0-9]+)|([0-9]+)\s*(?:\+|or\s*more|and\s*above|and\s*over|\s*units\s*or\s*more|\s*units\s*and\s*above))\s*(?:units?)?",
+            cleaned,
+            re.IGNORECASE,
+        )
+        for m in p_above_price_first:
+            price = float(m[0])
+            min_q = float(m[1]) if m[1] else float(m[2])
+            tiers.append({"min_qty": min_q, "max_qty": None, "unit_price": price})
+
+        # If price-first patterns extracted multiple tiers, deduplicate and return
+        if len(tiers) >= 2:
+            seen = {}
+            for t in tiers:
+                k = (t["min_qty"], t["max_qty"])
+                if k not in seen:
+                    seen[k] = t
+            deduped = list(seen.values())
+            deduped.sort(key=lambda x: x["min_qty"])
+            return deduped
+
+        # ---------------------------------------------------------------------
+        # Format 2: Quantity-First Patterns
+        # e.g., "1-999 units @ $5.00", "1000+ units @ $4.80", "below 500 units @ $12"
+        # ---------------------------------------------------------------------
+        qty_tiers: List[Dict[str, Any]] = []
+
+        # 2a. Quantity first, range: "1-999 units @ $5.00" or "500 to 999 units the unit price is $11.50"
+        p_range_qty_first = re.findall(
             r"(?:tier\s*\d+[:\s]*)?(?:orders?\s*(?:of)?\s*)?([0-9]+)\s*(?:-|to)\s*([0-9]+)\s*(?:units?)?\s*(?:@|at|:|=|the\s*unit\s*price\s*is|unit\s*price\s*(?:is|are|:|=)?|price\s*(?:is|are|:|=)?)\s*\$?([0-9]+(?:\.[0-9]+)?)",
-            text,
+            cleaned,
             re.IGNORECASE,
         )
-        for m in p1:
-            tiers.append({"min_qty": float(m[0]), "max_qty": float(m[1]), "unit_price": float(m[2])})
+        for q1, q2, price in p_range_qty_first:
+            qty_tiers.append({"min_qty": float(q1), "max_qty": float(q2), "unit_price": float(price)})
 
-        # Pattern 2: e.g. "1000+ units @ $4.80" or "1000 or more units unit price is $4.80"
-        p2 = re.findall(
-            r"(?:tier\s*\d+[:\s]*)?(?:orders?\s*(?:of)?\s*)?([0-9]+)\s*(?:\+|or\s*more|and\s*above|and\s*over)\s*(?:units?)?\s*(?:@|at|:|=|the\s*unit\s*price\s*is|unit\s*price\s*(?:is|are|:|=)?|price\s*(?:is|are|:|=)?)\s*\$?([0-9]+(?:\.[0-9]+)?)",
-            text,
+        # 2b. Quantity first, open-ended: "1000+ units @ $4.80", "1000 units or more @ $11"
+        p_above_qty_first = re.findall(
+            r"(?:tier\s*\d+[:\s]*)?(?:orders?\s*(?:of)?\s*)?([0-9]+)\s*(?:\+|or\s*more|and\s*above|and\s*over|\s*units\s*or\s*more|\s*units\s*and\s*above)\s*(?:units?)?\s*(?:@|at|:|=|the\s*unit\s*price\s*is|unit\s*price\s*(?:is|are|:|=)?|price\s*(?:is|are|:|=)?)\s*\$?([0-9]+(?:\.[0-9]+)?)",
+            cleaned,
             re.IGNORECASE,
         )
-        for m in p2:
-            tiers.append({"min_qty": float(m[0]), "max_qty": None, "unit_price": float(m[1])})
+        for q1, price in p_above_qty_first:
+            qty_tiers.append({"min_qty": float(q1), "max_qty": None, "unit_price": float(price)})
 
-        # Price-first pattern: "$5.00 for 1-999 units, $4.80 for 1000+ units"
-        if not tiers:
-            p3 = re.findall(
-                r"\$?([0-9]+(?:\.[0-9]+)?)\s*(?:per\s*unit)?\s*for\s*(?:orders?\s*(?:of)?\s*)?([0-9]+)\s*(?:-|to)\s*([0-9]+)\s*(?:units?)?",
-                text,
-                re.IGNORECASE,
-            )
-            for m in p3:
-                tiers.append({"min_qty": float(m[1]), "max_qty": float(m[2]), "unit_price": float(m[0])})
+        # 2c. Quantity first, upper-bounded: "below 500 units @ $12", "< 500 units: $12"
+        p_below_qty_first = re.findall(
+            r"(?:tier\s*\d+[:\s]*)?(?:orders?\s*(?:of)?\s*)?(?:below|under|less\s*than|fewer\s*than|up\s*to|<)\s*([0-9]+)\s*(?:units?)?\s*(?:@|at|:|=|the\s*unit\s*price\s*is|unit\s*price\s*(?:is|are|:|=)?|price\s*(?:is|are|:|=)?)\s*\$?([0-9]+(?:\.[0-9]+)?)",
+            cleaned,
+            re.IGNORECASE,
+        )
+        for upper, price in p_below_qty_first:
+            val = float(upper)
+            m_phrase = re.search(r"(below|under|less|fewer|<)\s*" + upper, cleaned, re.IGNORECASE)
+            max_q = (val - 1.0) if m_phrase else val
+            qty_tiers.append({"min_qty": 1.0, "max_qty": max_q, "unit_price": float(price)})
 
-            p4 = re.findall(
-                r"\$?([0-9]+(?:\.[0-9]+)?)\s*(?:per\s*unit)?\s*for\s*(?:orders?\s*(?:of)?\s*)?([0-9]+)\s*(?:\+|or\s*more|and\s*above|and\s*over)\s*(?:units?)?",
-                text,
-                re.IGNORECASE,
-            )
-            for m in p4:
-                tiers.append({"min_qty": float(m[1]), "max_qty": None, "unit_price": float(m[0])})
+        selected = qty_tiers if len(qty_tiers) >= len(tiers) else tiers
 
-        # Fallback generic range match: "< 500 @ $50, >= 500 @ $45"
-        if not tiers:
+        # 2d. Fallback generic bracket match: "< 500 @ $50, >= 500 @ $45"
+        if not selected:
             p5 = re.findall(
                 r"(?:tier\s*\d+:?\s*)?(?:<\s*([0-9]+)|([0-9]+)\s*-\s*([0-9]+)|>=?\s*([0-9]+))\s*(?:units)?\s*(?:@|at|for|:)\s*\$?([0-9]+(?:\.[0-9]+)?)",
-                text,
+                cleaned,
                 re.IGNORECASE,
             )
             for m in p5:
                 price = float(m[4])
                 if m[0]:
-                    tiers.append({"min_qty": 1.0, "max_qty": float(m[0]) - 1, "unit_price": price})
+                    selected.append({"min_qty": 1.0, "max_qty": float(m[0]) - 1, "unit_price": price})
                 elif m[1] and m[2]:
-                    tiers.append({"min_qty": float(m[1]), "max_qty": float(m[2]), "unit_price": price})
+                    selected.append({"min_qty": float(m[1]), "max_qty": float(m[2]), "unit_price": price})
                 elif m[3]:
-                    tiers.append({"min_qty": float(m[3]), "max_qty": None, "unit_price": price})
+                    selected.append({"min_qty": float(m[3]), "max_qty": None, "unit_price": price})
 
-        tiers.sort(key=lambda x: x["min_qty"])
-        return tiers
+        # Deduplicate by (min_qty, max_qty) and sort by min_qty
+        seen = {}
+        for t in selected:
+            k = (t["min_qty"], t["max_qty"])
+            if k not in seen:
+                seen[k] = t
+        deduped = list(seen.values())
+        deduped.sort(key=lambda x: x["min_qty"])
+        return deduped
 
     # =========================================================================
     # Stage 6: Explanation & Reporting Logic
