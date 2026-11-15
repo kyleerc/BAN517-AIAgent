@@ -126,8 +126,8 @@ def render_csv_data_analysis(uploaded_file):
 
     # Schema detection
     is_classification_schema = any(
-        c in df.columns for c in ["Sales ($)", "Sales", "sales", "SALES", "Sales_Dollar"]
-    ) and any(c in df.columns for c in ["Hits", "hits", "HITS"])
+        c in df.columns for c in ["Sales ($)", "Sales", "sales", "SALES", "Sales_Dollar", "Revenue"]
+    ) and any(c in df.columns for c in ["POS Hits", "pos hits", "POS_Hits", "Hits", "hits", "HITS", "Hit", "Picks"])
 
     is_basic_inventory_schema = all(
         c in df.columns for c in ["Product", "Category", "Units", "Unit Cost"]
@@ -137,7 +137,7 @@ def render_csv_data_analysis(uploaded_file):
         st.error("⚠️ Uploaded CSV does not match either supported inventory schema:")
         st.markdown(
             """
-            1. **Multi-Criteria Inventory Classification**: Requires columns `Item Number`, `Item Name`, `UoM`, `Sales ($)` (or `Sales`), and `Hits`.
+            1. **Multi-Criteria Inventory Classification**: Requires columns `Item Number`, `Item Name`, `UoM`, `Sales ($)` (or `Sales`), and `POS Hits` (or `Hits`).
             2. **Inventory Value Analysis**: Requires columns `Product`, `Category`, `Units`, and `Unit Cost`.
             """
         )
@@ -146,13 +146,16 @@ def render_csv_data_analysis(uploaded_file):
         return
 
     # ==========================================================================
-    # Capability 1: Multi-Criteria Inventory Classification (Sales & Hits)
+    # Capability 1: Multi-Criteria Inventory Classification (Sales & POS Hits)
     # ==========================================================================
     if is_classification_schema:
         st.header("🏷️ Multi-Criteria Inventory Classification (A, B, C, D)")
         st.caption(
-            "Inventory classified into **A, B, C, and D** classes using bi-criteria evaluation: "
-            "financial Pareto volume (**Sales**) and transaction/pick activity (**Hits**)."
+            "Classification pipeline: "
+            "**Step 1:** Pareto Ranking (Sales 0-60% A, 61-80% B, 81-90% C, 91-100% D; POS Hits 0-60% A, 61-80% B, 81-90% C, 91-100% D) → "
+            "Scores (A=4, B=3, C=2, D=1) | "
+            "**Step 2:** Combined Weighted Score = 0.65(Sales Score) + 0.35(Hits Score) | "
+            "**Step 3:** Final Class (A: 4.00-3.25, B: 3.24-2.50, C: 2.49-1.75, D: < 1.75)"
         )
 
         try:
@@ -173,15 +176,14 @@ def render_csv_data_analysis(uploaded_file):
         # Dataset Overview
         num_rows = len(df)
         num_cols = len(classified_df.columns)
-        col_names_str = ", ".join(classified_df.columns.tolist())
 
         meta1, meta2, meta3 = st.columns(3)
         with meta1:
             st.metric("Total Items (SKUs)", f"{num_rows:,}")
         with meta2:
-            st.metric("Columns", f"{num_cols}")
+            st.metric("Total Columns", f"{num_cols}")
         with meta3:
-            st.markdown(f"**Classification Fields:**\n`Sales Class`, `Hits Class`, `Matrix`, `Class`")
+            st.markdown(f"**Calculated Fields:**\n`Sales Score`, `Hits Score`, `Combined Weighted Score`, `Class`")
 
         # Top Executive KPIs
         st.subheader("📈 Classification Summary Metrics")
@@ -189,20 +191,25 @@ def render_csv_data_analysis(uploaded_file):
         with kpi1:
             st.metric("Total Sales ($)", f"${total_sales:,.2f}")
         with kpi2:
-            st.metric("Total Hits", f"{total_hits:,.0f}")
+            st.metric("Total POS Hits", f"{total_hits:,.0f}")
         with kpi3:
             cnt_a = len(classified_df[classified_df["Class"] == "A"])
-            st.metric("Class A SKUs", f"{cnt_a:,}", delta=f"{cnt_a/total_skus*100:.1f}%")
+            st.metric("Category A Items", f"{cnt_a:,}", delta=f"{cnt_a/total_skus*100:.1f}%")
         with kpi4:
             cnt_b = len(classified_df[classified_df["Class"] == "B"])
-            st.metric("Class B SKUs", f"{cnt_b:,}", delta=f"{cnt_b/total_skus*100:.1f}%")
+            st.metric("Category B Items", f"{cnt_b:,}", delta=f"{cnt_b/total_skus*100:.1f}%")
         with kpi5:
             cnt_cd = len(classified_df[classified_df["Class"].isin(["C", "D"])])
-            st.metric("Class C & D SKUs", f"{cnt_cd:,}", delta=f"{cnt_cd/total_skus*100:.1f}%")
+            st.metric("Category C & D Items", f"{cnt_cd:,}", delta=f"{cnt_cd/total_skus*100:.1f}%")
 
-        # Classification Distribution Table & Charts
-        st.subheader("📊 Multi-Criteria Class Distribution")
-        tab_dist, tab_matrix = st.tabs(["📋 Distribution Breakdown", "🔲 Bi-Criteria Matrix Grid"])
+        # Step 4: Required Classification Summary
+        st.subheader("📋 Step 4: Required Classification Summary")
+        st.markdown(
+            "Summary reporting the **number of items in each final category (A, B, C, and D)** "
+            "and the **total Sales** for all items in each category:"
+        )
+
+        tab_dist, tab_matrix = st.tabs(["📊 Category Summary Table & Visuals", "🔲 Bi-Criteria Matrix Grid"])
 
         with tab_dist:
             col_t1, col_t2 = st.columns([3, 2])
@@ -210,29 +217,31 @@ def render_csv_data_analysis(uploaded_file):
                 st.dataframe(
                     summary_df,
                     column_config={
-                        "Total Sales ($)": st.column_config.NumberColumn(format="$%.2f"),
-                        "% of Sales": st.column_config.NumberColumn(format="%.1f%%"),
-                        "Total Hits": st.column_config.NumberColumn(format="%d"),
-                        "% of Hits": st.column_config.NumberColumn(format="%.1f%%"),
-                        "% of SKUs": st.column_config.NumberColumn(format="%.1f%%"),
+                        "Final Category": st.column_config.TextColumn("Final Category"),
+                        "Item Count": st.column_config.NumberColumn("Item Count", format="%d"),
+                        "Total Sales ($)": st.column_config.NumberColumn("Total Sales ($)", format="$%.2f"),
+                        "% of Sales": st.column_config.NumberColumn("% of Sales", format="%.1f%%"),
+                        "Total POS Hits": st.column_config.NumberColumn("Total POS Hits", format="%d"),
+                        "% of POS Hits": st.column_config.NumberColumn("% of POS Hits", format="%.1f%%"),
+                        "% of Items": st.column_config.NumberColumn("% of Items", format="%.1f%%"),
                     },
                     use_container_width=True,
                     hide_index=True,
                 )
             with col_t2:
-                st.bar_chart(summary_df.set_index("Class")[["% of Sales", "% of Hits", "% of SKUs"]])
+                st.bar_chart(summary_df.set_index("Final Category")[["Total Sales ($)"]])
 
         with tab_matrix:
-            st.markdown("**Flores & Whybark 2D Cross-Tabulation Grid (Sales Class vs. Hits Class)**:")
+            st.markdown("**Bi-Criteria Cross-Tabulation Grid (Sales Class vs. POS Hits Class)**:")
             st.dataframe(crosstab_df, use_container_width=True)
 
         # Classified Data Table with interactive filtering
-        st.subheader("📋 Enriched Inventory Data Table")
+        st.subheader("📋 Classified Inventory Data Table")
         filter_col, dl_col = st.columns([2, 1])
         with filter_col:
             selected_class = st.selectbox(
-                "Filter table by Inventory Class:",
-                ["All Classes (A, B, C, D)", "Class A", "Class B", "Class C", "Class D"],
+                "Filter table by Final Inventory Class:",
+                ["All Categories (A, B, C, D)", "Category A", "Category B", "Category C", "Category D"],
             )
         with dl_col:
             st.write("")
@@ -244,7 +253,7 @@ def render_csv_data_analysis(uploaded_file):
                 use_container_width=True,
             )
 
-        if selected_class.startswith("Class "):
+        if selected_class.startswith("Category "):
             filtered_df = classified_df[classified_df["Class"] == selected_class.split()[-1]]
         else:
             filtered_df = classified_df
@@ -254,8 +263,9 @@ def render_csv_data_analysis(uploaded_file):
             column_config={
                 sales_col: st.column_config.NumberColumn("Sales ($)", format="$%.2f"),
                 "Sales Cumulative %": st.column_config.NumberColumn("Sales Cum %", format="%.2f%%"),
-                hits_col: st.column_config.NumberColumn("Hits", format="%d"),
+                hits_col: st.column_config.NumberColumn("POS Hits", format="%d"),
                 "Hits Cumulative %": st.column_config.NumberColumn("Hits Cum %", format="%.2f%%"),
+                "Combined Weighted Score": st.column_config.NumberColumn("Combined Weighted Score", format="%.2f"),
             },
             use_container_width=True,
         )

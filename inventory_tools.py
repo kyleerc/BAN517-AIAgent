@@ -1438,42 +1438,49 @@ def calculate_newsvendor(
 def classify_inventory_multicriteria(
     df: Any,
     sales_col: Optional[str] = None,
-    hits_col: str = "Hits",
+    hits_col: Optional[str] = None,
     item_num_col: str = "Item Number",
     item_name_col: str = "Item Name",
     uom_col: str = "UoM",
     thresholds: Optional[Dict[str, float]] = None,
-    sales_weight: float = 0.5,
-    hits_weight: float = 0.5,
+    sales_weight: float = 0.65,
+    hits_weight: float = 0.35,
 ) -> Dict[str, Any]:
-    """Perform multi-criteria inventory classification using Sales ($) and Hits.
+    """Perform multi-criteria inventory classification using Sales and POS Hits.
 
-    Classifies items into classes A, B, C, and D based on:
-    1. Financial Pareto volume (Sales)
-    2. Operational activity / pick frequency (Hits)
-    3. Bi-criteria cross-tabulation matrix and composite weighted score.
+    Implementation Steps:
+    - Step 1: Classify Sales and POS Hits separately using Pareto cumulative thresholds:
+              0-60%: A, 61-80%: B, 81-90%: C, 91-100%: D.
+              Convert tiers to scores: A = 4, B = 3, C = 2, D = 1.
+    - Step 2: Combined Weighted Score = 0.65*(Sales Score) + 0.35*(Hits Score).
+    - Step 3: Assign Final Inventory Class:
+              A: 4.00 - 3.25
+              B: 3.24 - 2.50
+              C: 2.49 - 1.75
+              D: < 1.75
+    - Step 4: Classification summary reporting item count and total Sales per category.
 
     Parameters:
         df: pandas DataFrame containing inventory item records.
         sales_col: Name of column containing Sales ($) values. Auto-detected if None.
-        hits_col: Name of column containing transaction/pick hit counts.
+        hits_col: Name of column containing POS Hits counts. Auto-detected if None.
         item_num_col: Name of column containing Item Number/SKU.
         item_name_col: Name of column containing Item Name.
         uom_col: Name of column containing Unit of Measure.
         thresholds: Cumulative cutoff thresholds for classes A, B, C, D.
-                    Defaults to {"A": 0.70, "B": 0.90, "C": 0.99, "D": 1.00}.
-        sales_weight: Weight for Sales in composite score (default: 0.5).
-        hits_weight: Weight for Hits in composite score (default: 0.5).
+                    Defaults to {"A": 0.60, "B": 0.80, "C": 0.90, "D": 1.00}.
+        sales_weight: Weight for Sales in composite score (default: 0.65).
+        hits_weight: Weight for POS Hits in composite score (default: 0.35).
 
     Returns:
         Structured dictionary containing:
         - classified_df: DataFrame with appended classification columns.
-        - class_summary: DataFrame summarizing SKU count, Sales, and Hits by Class.
+        - class_summary: DataFrame summarizing Item Count and Total Sales by category.
         - matrix_crosstab: 2D cross-tabulation table of Sales Class vs Hits Class.
         - total_skus: Total number of inventory items.
         - total_sales: Total revenue across all items.
-        - total_hits: Total order/pick transactions across all items.
-        - class_counts: Dictionary mapping A, B, C, D to SKU counts.
+        - total_hits: Total POS Hits across all items.
+        - class_counts: Dictionary mapping A, B, C, D to item counts.
         - sales_col: Name of resolved sales column.
         - hits_col: Name of resolved hits column.
     """
@@ -1497,16 +1504,16 @@ def classify_inventory_multicriteria(
             f"Missing required Sales column in DataFrame. Available columns: {list(df.columns)}"
         )
 
-    # Auto-detect Hits column if default not in columns
-    if hits_col not in df.columns:
-        for candidate in ["Hits", "hits", "HITS", "Hit", "Frequency", "Picks"]:
+    # Auto-detect Hits / POS Hits column if not explicitly provided
+    if hits_col is None or hits_col not in df.columns:
+        for candidate in ["POS Hits", "pos hits", "POS_Hits", "Hits", "hits", "HITS", "Hit", "Frequency", "Picks"]:
             if candidate in df.columns:
                 hits_col = candidate
                 break
 
-    if hits_col not in df.columns:
+    if hits_col is None or hits_col not in df.columns:
         raise InventoryCalculationError(
-            f"Missing required Hits column in DataFrame. Available columns: {list(df.columns)}"
+            f"Missing required POS Hits column in DataFrame. Available columns: {list(df.columns)}"
         )
 
     # Copy DataFrame to avoid modifying original input
@@ -1523,8 +1530,9 @@ def classify_inventory_multicriteria(
         errors="coerce",
     ).fillna(0.0)
 
+    # Pareto Thresholds: 0-60%: A, 61-80%: B, 81-90%: C, 91-100%: D
     if thresholds is None:
-        thresholds = {"A": 0.70, "B": 0.90, "C": 0.99, "D": 1.00}
+        thresholds = {"A": 0.60, "B": 0.80, "C": 0.90, "D": 1.00}
 
     def assign_tier(val: float, prev_pct: float) -> str:
         if val <= 0:
@@ -1538,7 +1546,7 @@ def classify_inventory_multicriteria(
         else:
             return "D"
 
-    # 1. Criteria 1: Sales Classification (Pareto Cumulative Distribution)
+    # Step 1a: Sales Classification (Pareto Cumulative Distribution)
     sales_sorted = res_df.sort_values(by="_sales_clean", ascending=False).copy()
     tot_sales = sales_sorted["_sales_clean"].sum()
     cum_sales = sales_sorted["_sales_clean"].cumsum()
@@ -1552,7 +1560,7 @@ def classify_inventory_multicriteria(
         assign_tier(v, p) for v, p in zip(sales_sorted["_sales_clean"], prev_cum_sales_pct)
     ]
 
-    # 2. Criteria 2: Hits Classification (Velocity Cumulative Distribution)
+    # Step 1b: POS Hits Classification (Velocity Cumulative Distribution)
     hits_sorted = res_df.sort_values(by="_hits_clean", ascending=False).copy()
     tot_hits = hits_sorted["_hits_clean"].sum()
     cum_hits = hits_sorted["_hits_clean"].cumsum()
@@ -1566,45 +1574,54 @@ def classify_inventory_multicriteria(
         assign_tier(v, p) for v, p in zip(hits_sorted["_hits_clean"], prev_cum_hits_pct)
     ]
 
-    # Realign sorted series to the DataFrame's original index
+    # Realign sorted series to original DataFrame index
     res_df["Sales Cumulative %"] = sales_sorted["Sales Cumulative %"].round(2)
     res_df["Sales Class"] = sales_sorted["Sales Class"]
     res_df["Hits Cumulative %"] = hits_sorted["Hits Cumulative %"].round(2)
     res_df["Hits Class"] = hits_sorted["Hits Class"]
 
-    # 3. Bi-Criteria Matrix Code (Sales-Hits)
+    # Bi-Criteria Matrix Code (Sales-Hits)
     res_df["Matrix (Sales-Hits)"] = res_df["Sales Class"] + "-" + res_df["Hits Class"]
 
-    # 4. Multi-Criteria Composite Class (A, B, C, D)
+    # Step 1c: Numerical Score Conversion: A = 4, B = 3, C = 2, D = 1
     score_map = {"A": 4, "B": 3, "C": 2, "D": 1}
-    res_df["_sales_score"] = res_df["Sales Class"].map(score_map)
-    res_df["_hits_score"] = res_df["Hits Class"].map(score_map)
-    res_df["_composite_score"] = sales_weight * res_df["_sales_score"] + hits_weight * res_df["_hits_score"]
+    res_df["Sales Score"] = res_df["Sales Class"].map(score_map)
+    res_df["Hits Score"] = res_df["Hits Class"].map(score_map)
 
-    def map_composite_class(score: float) -> str:
-        if score >= 3.5:
+    # Step 2: Calculate Combined Weighted Score = 0.65(Sales Score) + 0.35(Hits Score)
+    res_df["Combined Weighted Score"] = (
+        sales_weight * res_df["Sales Score"] + hits_weight * res_df["Hits Score"]
+    ).round(2)
+
+    # Step 3: Assign Final Inventory Class:
+    # A: 4.00 - 3.25
+    # B: 3.24 - 2.50
+    # C: 2.49 - 1.75
+    # D: < 1.75
+    def map_final_class(score: float) -> str:
+        if score >= 3.25:
             return "A"
-        elif score >= 2.5:
+        elif score >= 2.50:
             return "B"
-        elif score >= 1.5:
+        elif score >= 1.75:
             return "C"
         else:
             return "D"
 
-    res_df["Class"] = res_df["_composite_score"].apply(map_composite_class)
+    res_df["Class"] = res_df["Combined Weighted Score"].apply(map_final_class)
 
     # Clean temporary calculation columns
-    res_df = res_df.drop(
-        columns=["_sales_clean", "_hits_clean", "_sales_score", "_hits_score", "_composite_score"]
-    )
+    res_df = res_df.drop(columns=["_sales_clean", "_hits_clean"])
 
-    # 5. Compute Aggregate Summary Metrics
+    # Step 4: Required Classification Summary
+    # Report the number of items in each final category (A, B, C, and D) and total Sales
     total_skus = len(res_df)
     total_sales_val = float(tot_sales)
     total_hits_val = float(tot_hits)
 
     class_summary_rows = []
     class_counts: Dict[str, int] = {}
+    category_sales_summary: Dict[str, Dict[str, Any]] = {}
 
     for c in ["A", "B", "C", "D"]:
         subset = res_df[res_df["Class"] == c]
@@ -1629,18 +1646,25 @@ def classify_inventory_multicriteria(
         hits_pct = (sub_hits / total_hits_val * 100.0) if total_hits_val > 0 else 0.0
 
         class_summary_rows.append({
-            "Class": c,
-            "SKU Count": count,
-            "% of SKUs": round(sku_pct, 1),
+            "Final Category": c,
+            "Item Count": count,
+            "% of Items": round(sku_pct, 1),
             "Total Sales ($)": round(sub_sales, 2),
             "% of Sales": round(sales_pct, 1),
-            "Total Hits": int(round(sub_hits)),
-            "% of Hits": round(hits_pct, 1),
+            "Total POS Hits": int(round(sub_hits)),
+            "% of POS Hits": round(hits_pct, 1),
         })
+
+        category_sales_summary[c] = {
+            "item_count": count,
+            "total_sales": round(sub_sales, 2),
+            "pct_of_items": round(sku_pct, 1),
+            "pct_of_sales": round(sales_pct, 1),
+        }
 
     class_summary_df = pd.DataFrame(class_summary_rows)
 
-    # 6. Bi-Criteria 2D Cross-Tabulation Grid
+    # Bi-Criteria 2D Cross-Tabulation Grid
     crosstab_df = pd.crosstab(
         res_df["Sales Class"],
         res_df["Hits Class"],
@@ -1655,6 +1679,7 @@ def classify_inventory_multicriteria(
     return {
         "classified_df": res_df,
         "class_summary": class_summary_df,
+        "category_sales_summary": category_sales_summary,
         "crosstab": crosstab_df,
         "total_skus": total_skus,
         "total_sales": total_sales_val,
