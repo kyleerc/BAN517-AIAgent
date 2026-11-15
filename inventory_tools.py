@@ -1429,3 +1429,237 @@ def calculate_newsvendor(
         },
         "recommendation": recommendation,
     }
+
+
+# ==============================================================================
+# 6. Multi-Criteria Inventory Classification (Sales & Hits)
+# ==============================================================================
+
+def classify_inventory_multicriteria(
+    df: Any,
+    sales_col: Optional[str] = None,
+    hits_col: str = "Hits",
+    item_num_col: str = "Item Number",
+    item_name_col: str = "Item Name",
+    uom_col: str = "UoM",
+    thresholds: Optional[Dict[str, float]] = None,
+    sales_weight: float = 0.5,
+    hits_weight: float = 0.5,
+) -> Dict[str, Any]:
+    """Perform multi-criteria inventory classification using Sales ($) and Hits.
+
+    Classifies items into classes A, B, C, and D based on:
+    1. Financial Pareto volume (Sales)
+    2. Operational activity / pick frequency (Hits)
+    3. Bi-criteria cross-tabulation matrix and composite weighted score.
+
+    Parameters:
+        df: pandas DataFrame containing inventory item records.
+        sales_col: Name of column containing Sales ($) values. Auto-detected if None.
+        hits_col: Name of column containing transaction/pick hit counts.
+        item_num_col: Name of column containing Item Number/SKU.
+        item_name_col: Name of column containing Item Name.
+        uom_col: Name of column containing Unit of Measure.
+        thresholds: Cumulative cutoff thresholds for classes A, B, C, D.
+                    Defaults to {"A": 0.70, "B": 0.90, "C": 0.99, "D": 1.00}.
+        sales_weight: Weight for Sales in composite score (default: 0.5).
+        hits_weight: Weight for Hits in composite score (default: 0.5).
+
+    Returns:
+        Structured dictionary containing:
+        - classified_df: DataFrame with appended classification columns.
+        - class_summary: DataFrame summarizing SKU count, Sales, and Hits by Class.
+        - matrix_crosstab: 2D cross-tabulation table of Sales Class vs Hits Class.
+        - total_skus: Total number of inventory items.
+        - total_sales: Total revenue across all items.
+        - total_hits: Total order/pick transactions across all items.
+        - class_counts: Dictionary mapping A, B, C, D to SKU counts.
+        - sales_col: Name of resolved sales column.
+        - hits_col: Name of resolved hits column.
+    """
+    import pandas as pd
+
+    if not isinstance(df, pd.DataFrame):
+        raise InventoryCalculationError("Input data must be a pandas DataFrame.")
+
+    if df.empty:
+        raise InventoryCalculationError("Input DataFrame is empty; cannot perform inventory classification.")
+
+    # Auto-detect Sales column if not explicitly provided
+    if sales_col is None or sales_col not in df.columns:
+        for candidate in ["Sales ($)", "Sales", "sales", "SALES", "Sales_Dollar", "Revenue"]:
+            if candidate in df.columns:
+                sales_col = candidate
+                break
+
+    if sales_col is None or sales_col not in df.columns:
+        raise InventoryCalculationError(
+            f"Missing required Sales column in DataFrame. Available columns: {list(df.columns)}"
+        )
+
+    # Auto-detect Hits column if default not in columns
+    if hits_col not in df.columns:
+        for candidate in ["Hits", "hits", "HITS", "Hit", "Frequency", "Picks"]:
+            if candidate in df.columns:
+                hits_col = candidate
+                break
+
+    if hits_col not in df.columns:
+        raise InventoryCalculationError(
+            f"Missing required Hits column in DataFrame. Available columns: {list(df.columns)}"
+        )
+
+    # Copy DataFrame to avoid modifying original input
+    res_df = df.copy()
+
+    # Clean numeric columns (handling dollar signs, commas, and string formatting)
+    res_df["_sales_clean"] = pd.to_numeric(
+        res_df[sales_col].astype(str).str.replace("$", "", regex=False).str.replace(",", "", regex=False).str.strip(),
+        errors="coerce",
+    ).fillna(0.0)
+
+    res_df["_hits_clean"] = pd.to_numeric(
+        res_df[hits_col].astype(str).str.replace(",", "", regex=False).str.strip(),
+        errors="coerce",
+    ).fillna(0.0)
+
+    if thresholds is None:
+        thresholds = {"A": 0.70, "B": 0.90, "C": 0.99, "D": 1.00}
+
+    def assign_tier(val: float, prev_pct: float) -> str:
+        if val <= 0:
+            return "D"
+        if prev_pct < thresholds["A"]:
+            return "A"
+        elif prev_pct < thresholds["B"]:
+            return "B"
+        elif prev_pct < thresholds["C"]:
+            return "C"
+        else:
+            return "D"
+
+    # 1. Criteria 1: Sales Classification (Pareto Cumulative Distribution)
+    sales_sorted = res_df.sort_values(by="_sales_clean", ascending=False).copy()
+    tot_sales = sales_sorted["_sales_clean"].sum()
+    cum_sales = sales_sorted["_sales_clean"].cumsum()
+    prev_cum_sales = cum_sales.shift(1, fill_value=0.0)
+    div_sales = tot_sales if tot_sales > 0 else 1.0
+
+    sales_sorted["Sales Cumulative %"] = (cum_sales / div_sales) * 100.0
+    prev_cum_sales_pct = prev_cum_sales / div_sales
+
+    sales_sorted["Sales Class"] = [
+        assign_tier(v, p) for v, p in zip(sales_sorted["_sales_clean"], prev_cum_sales_pct)
+    ]
+
+    # 2. Criteria 2: Hits Classification (Velocity Cumulative Distribution)
+    hits_sorted = res_df.sort_values(by="_hits_clean", ascending=False).copy()
+    tot_hits = hits_sorted["_hits_clean"].sum()
+    cum_hits = hits_sorted["_hits_clean"].cumsum()
+    prev_cum_hits = cum_hits.shift(1, fill_value=0.0)
+    div_hits = tot_hits if tot_hits > 0 else 1.0
+
+    hits_sorted["Hits Cumulative %"] = (cum_hits / div_hits) * 100.0
+    prev_cum_hits_pct = prev_cum_hits / div_hits
+
+    hits_sorted["Hits Class"] = [
+        assign_tier(v, p) for v, p in zip(hits_sorted["_hits_clean"], prev_cum_hits_pct)
+    ]
+
+    # Realign sorted series to the DataFrame's original index
+    res_df["Sales Cumulative %"] = sales_sorted["Sales Cumulative %"].round(2)
+    res_df["Sales Class"] = sales_sorted["Sales Class"]
+    res_df["Hits Cumulative %"] = hits_sorted["Hits Cumulative %"].round(2)
+    res_df["Hits Class"] = hits_sorted["Hits Class"]
+
+    # 3. Bi-Criteria Matrix Code (Sales-Hits)
+    res_df["Matrix (Sales-Hits)"] = res_df["Sales Class"] + "-" + res_df["Hits Class"]
+
+    # 4. Multi-Criteria Composite Class (A, B, C, D)
+    score_map = {"A": 4, "B": 3, "C": 2, "D": 1}
+    res_df["_sales_score"] = res_df["Sales Class"].map(score_map)
+    res_df["_hits_score"] = res_df["Hits Class"].map(score_map)
+    res_df["_composite_score"] = sales_weight * res_df["_sales_score"] + hits_weight * res_df["_hits_score"]
+
+    def map_composite_class(score: float) -> str:
+        if score >= 3.5:
+            return "A"
+        elif score >= 2.5:
+            return "B"
+        elif score >= 1.5:
+            return "C"
+        else:
+            return "D"
+
+    res_df["Class"] = res_df["_composite_score"].apply(map_composite_class)
+
+    # Clean temporary calculation columns
+    res_df = res_df.drop(
+        columns=["_sales_clean", "_hits_clean", "_sales_score", "_hits_score", "_composite_score"]
+    )
+
+    # 5. Compute Aggregate Summary Metrics
+    total_skus = len(res_df)
+    total_sales_val = float(tot_sales)
+    total_hits_val = float(tot_hits)
+
+    class_summary_rows = []
+    class_counts: Dict[str, int] = {}
+
+    for c in ["A", "B", "C", "D"]:
+        subset = res_df[res_df["Class"] == c]
+        count = len(subset)
+        class_counts[c] = count
+        sku_pct = (count / total_skus * 100.0) if total_skus > 0 else 0.0
+
+        sub_sales = float(
+            pd.to_numeric(
+                subset[sales_col].astype(str).str.replace("$", "", regex=False).str.replace(",", "", regex=False),
+                errors="coerce",
+            ).fillna(0.0).sum()
+        )
+        sales_pct = (sub_sales / total_sales_val * 100.0) if total_sales_val > 0 else 0.0
+
+        sub_hits = float(
+            pd.to_numeric(
+                subset[hits_col].astype(str).str.replace(",", "", regex=False),
+                errors="coerce",
+            ).fillna(0.0).sum()
+        )
+        hits_pct = (sub_hits / total_hits_val * 100.0) if total_hits_val > 0 else 0.0
+
+        class_summary_rows.append({
+            "Class": c,
+            "SKU Count": count,
+            "% of SKUs": round(sku_pct, 1),
+            "Total Sales ($)": round(sub_sales, 2),
+            "% of Sales": round(sales_pct, 1),
+            "Total Hits": int(round(sub_hits)),
+            "% of Hits": round(hits_pct, 1),
+        })
+
+    class_summary_df = pd.DataFrame(class_summary_rows)
+
+    # 6. Bi-Criteria 2D Cross-Tabulation Grid
+    crosstab_df = pd.crosstab(
+        res_df["Sales Class"],
+        res_df["Hits Class"],
+        margins=True,
+        margins_name="Total",
+    ).reindex(
+        index=["A", "B", "C", "D", "Total"],
+        columns=["A", "B", "C", "D", "Total"],
+        fill_value=0,
+    )
+
+    return {
+        "classified_df": res_df,
+        "class_summary": class_summary_df,
+        "crosstab": crosstab_df,
+        "total_skus": total_skus,
+        "total_sales": total_sales_val,
+        "total_hits": total_hits_val,
+        "class_counts": class_counts,
+        "sales_col": sales_col,
+        "hits_col": hits_col,
+    }
