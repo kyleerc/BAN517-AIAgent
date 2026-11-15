@@ -496,127 +496,131 @@ class InventoryDecisionAgent:
         missing: List[str] = []
         q_work = q
 
-        # 1. Lead-time standard deviation (distinguished and masked before average lead time)
-        std_lt_m = re.search(
-            r"(?:standard\s*deviation\s*of\s*lead\s*time|lead[- ]?time\s*(?:standard\s*deviation|std\s*dev)|sigma_l)\s*(?:of|is|are|:|=)?\s*([0-9]+(?:\.[0-9]+)?)",
+        # Plain language assignment: treats "is", "is equal to", "equals", "equal to", ":", "=", "of", "averages" as equivalent assignment operators.
+        assign_op = r"(?:is\s*(?:equal\s*to|set\s*to|set\s*at)?|equals|equal\s*to|has\s*an?\s*(?:average|mean)\s*(?:of)?|averages|are|of|:|=)"
+
+        # 1. Lead Time & Lead-Time Standard Deviation
+        # Combined pattern: e.g., "Average lead time is 3 weeks with a standard deviation of 0.5 weeks"
+        # "lead time = 3 weeks, std dev is 0.5 weeks", "average lead time of 3 weeks and std dev of 0.5"
+        lt_comb_m = re.search(
+            r"(?:average|mean|expected)?\s*(?:supplier\s*)?lead\s*time\s*" + assign_op + r"\s*([0-9]+(?:\.[0-9]+)?)\s*(?:days?|weeks?|months?|periods?)?\s*(?:,|;)?\s*(?:\(?\s*(?:with|and)?\s*(?:a\s*)?(?:standard\s*deviation|std\s*dev)\s*" + assign_op + r"?)\s*([0-9]+(?:\.[0-9]+)?)",
             q_work,
             re.IGNORECASE,
         )
-        if std_lt_m:
-            extracted["std_lead_time"] = float(std_lt_m.group(1))
-            q_work = q_work[:std_lt_m.start()] + " [MASKED_STD_LT] " + q_work[std_lt_m.end():]
-        else:
-            m_sec = re.search(
-                r"lead\s*time\s*(?:of|is|are|:|=)?\s*[0-9]+(?:\.[0-9]+)?\s*(?:days?|weeks?|months?)\s*(?:with\s*(?:a\s*)?standard\s*deviation\s*of|std\s*dev\s*(?:of)?)\s*([0-9]+(?:\.[0-9]+)?)",
+        if lt_comb_m:
+            extracted["lead_time"] = float(lt_comb_m.group(1))
+            extracted["std_lead_time"] = float(lt_comb_m.group(2))
+            q_work = q_work[:lt_comb_m.start()] + " [MASKED_LT_AND_STD] " + q_work[lt_comb_m.end():]
+
+        # Standalone lead-time standard deviation if not captured in combined pattern
+        if "std_lead_time" not in extracted:
+            std_lt_m = re.search(
+                r"(?:standard\s*deviation\s*of\s*(?:supplier\s*)?lead\s*time|(?:supplier\s*)?lead[- ]?time\s*(?:standard\s*deviation|std\s*dev)|sigma_l)\s*" + assign_op + r"?\s*([0-9]+(?:\.[0-9]+)?)",
                 q_work,
                 re.IGNORECASE,
             )
-            if m_sec:
-                extracted["std_lead_time"] = float(m_sec.group(1))
-                q_work = q_work[:m_sec.start()] + " [MASKED_STD_LT] " + q_work[m_sec.end():]
+            if std_lt_m:
+                extracted["std_lead_time"] = float(std_lt_m.group(1))
+                q_work = q_work[:std_lt_m.start()] + " [MASKED_STD_LT] " + q_work[std_lt_m.end():]
             else:
                 extracted["std_lead_time"] = 0.0
 
-        # 2. Demand standard deviation (distinguished and masked before average demand)
-        std_d_m = re.search(
-            r"(?:standard\s*deviation\s*of\s*(?:daily|weekly|periodic)?\s*demand|demand\s*(?:standard\s*deviation|std\s*dev)|sigma_d)\s*(?:of|is|are|:|=)?\s*([0-9]+(?:\.[0-9]+)?)",
+        # 2. Demand & Demand Standard Deviation
+        # Combined pattern: e.g., "average demand of 40 units per day with a standard deviation of 8 units per day"
+        # "average demand is 40 units per day with a standard deviation of 8 units"
+        d_comb_m = re.search(
+            r"(?:average|mean|expected|daily|weekly|periodic)?\s*demand\s*(?:rate)?\s*" + assign_op + r"\s*([0-9]+(?:\.[0-9]+)?)\s*(?:units?|boxes?|cases?|items?)?(?:\s*(?:per|/|a)\s*(?:day|week|month))?\s*(?:,|;)?\s*(?:\(?\s*(?:with|and)?\s*(?:a\s*)?(?:standard\s*deviation|std\s*dev)\s*" + assign_op + r"?)\s*([0-9]+(?:\.[0-9]+)?)",
             q_work,
             re.IGNORECASE,
         )
-        if std_d_m:
-            extracted["std_demand"] = float(std_d_m.group(1))
-            q_work = q_work[:std_d_m.start()] + " [MASKED_STD_D] " + q_work[std_d_m.end():]
-        else:
-            m_sec = re.search(
-                r"(?<!lead[- ]time\s)standard\s*deviation\s*(?:of|is|are|:|=)?\s*([0-9]+(?:\.[0-9]+)?)\s*(?:units?|items?|cases?|boxes?)",
-                q_work,
-                re.IGNORECASE,
-            )
-            if m_sec:
-                extracted["std_demand"] = float(m_sec.group(1))
-                q_work = q_work[:m_sec.start()] + " [MASKED_STD_D] " + q_work[m_sec.end():]
-            else:
-                extracted["std_demand"] = 0.0
+        if d_comb_m:
+            extracted["avg_demand"] = float(d_comb_m.group(1))
+            extracted["std_demand"] = float(d_comb_m.group(2))
+            q_work = q_work[:d_comb_m.start()] + " [MASKED_D_AND_STD] " + q_work[d_comb_m.end():]
 
-        # 3. Average Lead Time (L) - extracted from q_work (safe from std dev interference)
-        lt_m = re.search(
-            r"(?:average|mean|expected)?\s*lead\s*time\s*(?:has\s*an?\s*(?:average|mean)\s*(?:of)?|averages|of|is|are|:|=)?\s*([0-9]+(?:\.[0-9]+)?)\s*(?:days?|weeks?|months?|periods?)?",
-            q_work,
-            re.IGNORECASE,
-        )
-        if lt_m and lt_m.group(1):
-            extracted["lead_time"] = float(lt_m.group(1))
-        else:
-            m_lt2 = re.search(
-                r"([0-9]+(?:\.[0-9]+)?)\s*(?:day|week|month|period)s?\s*(?:lead\s*time|delivery\s*time|replenishment\s*time)",
+        # Standalone demand standard deviation if not captured in combined pattern
+        if "std_demand" not in extracted:
+            std_d_m = re.search(
+                r"(?:standard\s*deviation\s*of\s*(?:daily|weekly|periodic)?\s*demand|demand\s*(?:standard\s*deviation|std\s*dev)|sigma_d)\s*" + assign_op + r"?\s*([0-9]+(?:\.[0-9]+)?)",
                 q_work,
                 re.IGNORECASE,
             )
-            if m_lt2:
-                extracted["lead_time"] = float(m_lt2.group(1))
+            if std_d_m:
+                extracted["std_demand"] = float(std_d_m.group(1))
+                q_work = q_work[:std_d_m.start()] + " [MASKED_STD_D] " + q_work[std_d_m.end():]
             else:
+                m_sec = re.search(
+                    r"(?<!lead[- ]time\s)standard\s*deviation\s*" + assign_op + r"?\s*([0-9]+(?:\.[0-9]+)?)\s*(?:units?|items?|cases?|boxes?)",
+                    q_work,
+                    re.IGNORECASE,
+                )
+                if m_sec:
+                    extracted["std_demand"] = float(m_sec.group(1))
+                    q_work = q_work[:m_sec.start()] + " [MASKED_STD_D] " + q_work[m_sec.end():]
+                else:
+                    extracted["std_demand"] = 0.0
+
+        # 3. Average Lead Time (L) - extracted from q_work
+        # Explicitly recognizes natural language including "average lead time is" (where "is" = "=")
+        if "lead_time" not in extracted:
+            lt_patterns = [
+                r"(?:average|mean|expected)?\s*(?:supplier\s*)?lead\s*time\s*" + assign_op + r"\s*([0-9]+(?:\.[0-9]+)?)\s*(?:days?|weeks?|months?|periods?)?",
+                r"(?:average|mean|expected)?\s*(?:supplier\s*)?lead\s*time\s*([0-9]+(?:\.[0-9]+)?)\s*(?:days?|weeks?|months?|periods?)",
+                r"([0-9]+(?:\.[0-9]+)?)\s*(?:day|week|month|period)s?\s*(?:of\s*)?(?:supplier\s*)?(?:lead\s*time|delivery\s*time|replenishment\s*time)",
+            ]
+            for pat in lt_patterns:
+                lt_m = re.search(pat, q_work, re.IGNORECASE)
+                if lt_m and lt_m.group(1):
+                    extracted["lead_time"] = float(lt_m.group(1))
+                    q_work = q_work[:lt_m.start()] + " [MASKED_LT] " + q_work[lt_m.end():]
+                    break
+            if "lead_time" not in extracted:
                 missing.append("lead_time (Average lead time L in days/weeks)")
 
-        # 4. Average Demand (d) - extracted from q_work (safe from std dev interference)
-        d_m = re.search(
-            r"(?:average|mean|expected|daily|weekly|periodic)?\s*demand\s*(?:rate)?\s*(?:has\s*an?\s*(?:average|mean)\s*(?:of)?|averages|of|is|are|:|=)?\s*([0-9]+(?:\.[0-9]+)?)\s*(?:units?|boxes?|cases?|items?)?(?:\s*(?:per|/|a)\s*(?:day|week|month))?",
-            q_work,
-            re.IGNORECASE,
-        )
-        if not d_m:
-            d_m = re.search(
-                r"(?:daily|weekly|periodic)?\s*demand\s*(?:rate)?\s*(?:has\s*an?\s*(?:average|mean)\s*(?:of)?|averages|is|are|of|:|=)\s*([0-9]+(?:\.[0-9]+)?)\s*(?:units?|boxes?|cases?|items?)?(?:\s*(?:per|/|a)\s*(?:day|week|month))?",
-                q_work,
-                re.IGNORECASE,
-            )
-        if not d_m:
-            d_m = re.search(
+        # 4. Average Demand (d) - extracted from q_work
+        # Explicitly recognizes natural language including "demand is", "average demand is" (where "is" = "=")
+        if "avg_demand" not in extracted:
+            d_patterns = [
+                r"(?:average|mean|expected|daily|weekly|periodic)?\s*demand\s*(?:rate)?\s*" + assign_op + r"\s*([0-9]+(?:\.[0-9]+)?)\s*(?:units?|boxes?|cases?|items?)?(?:\s*(?:per|/|a)\s*(?:day|week|month))?",
                 r"(?:average|mean|expected)\s*(?:of)?\s*([0-9]+(?:\.[0-9]+)?)\s*(?:units?|boxes?|cases?|items?)?\s*(?:per|/|a)\s*(?:day|week|month)",
-                q_work,
-                re.IGNORECASE,
-            )
-        if not d_m:
-            d_m = re.search(
-                r"demand\s*(?:rate)?\s*(?:of|is|are|:|=)\s*([0-9]+(?:\.[0-9]+)?)\s*(?:units?|boxes?|cases?|items?)?(?:\s*(?:per|/|a)\s*(?:day|week|month))?",
-                q_work,
-                re.IGNORECASE,
-            )
-        if not d_m:
-            d_m = re.search(
                 r"([0-9]+(?:\.[0-9]+)?)\s*(?:units?|boxes?|cases?|items?)\s*(?:per|/|a)\s*(?:day|week|month)",
-                q_work,
-                re.IGNORECASE,
-            )
-        if d_m and d_m.group(1):
-            extracted["avg_demand"] = float(d_m.group(1))
-        else:
-            missing.append("avg_demand (Average demand per period d)")
+            ]
+            for pat in d_patterns:
+                d_m = re.search(pat, q_work, re.IGNORECASE)
+                if d_m and d_m.group(1):
+                    extracted["avg_demand"] = float(d_m.group(1))
+                    q_work = q_work[:d_m.start()] + " [MASKED_D] " + q_work[d_m.end():]
+                    break
+            if "avg_demand" not in extracted:
+                missing.append("avg_demand (Average demand per period d)")
 
         # 5. Explicit Safety Stock if directly specified
+        # Recognizes "safety stock is", "safety stock =", "safety stock of", etc.
         explicit_ss = self._extract_first_number(
             q_work,
             [
-                r"(?:safety\s*stock|safety\s*buffer)\s*(?:of|is|are|:|=)?\s*([0-9]+(?:\.[0-9]+)?)",
-                r"maintain\s*(?:a\s*)?safety\s*stock\s*of\s*([0-9]+(?:\.[0-9]+)?)",
+                r"(?:safety\s*stock|safety\s*buffer)\s*" + assign_op + r"?\s*([0-9]+(?:\.[0-9]+)?)",
+                r"maintain\s*(?:a\s*)?safety\s*stock\s*" + assign_op + r"?\s*([0-9]+(?:\.[0-9]+)?)",
             ],
         )
         if explicit_ss is not None:
             extracted["safety_stock"] = float(explicit_ss)
 
         # 6. Service Level or Z-Score
+        # Recognizes "service level is", "service level =", "service level of", etc.
         service_level = self._extract_first_number(
             q_work,
             [
-                r"(?:cycle\s*)?service\s*level\s*(?:of|is|are|:|=)?\s*([0-9]+(?:\.[0-9]+)?)\s*%?",
+                r"(?:cycle\s*)?service\s*level\s*" + assign_op + r"?\s*([0-9]+(?:\.[0-9]+)?)\s*%?",
                 r"([0-9]+(?:\.[0-9]+)?)\s*%\s*(?:cycle\s*)?service\s*level",
-                r"csl\s*(?:of|is|are|:|=)?\s*([0-9]+(?:\.[0-9]+)?)",
+                r"csl\s*" + assign_op + r"?\s*([0-9]+(?:\.[0-9]+)?)",
             ],
         )
         z_score = self._extract_first_number(
             q_work,
             [
-                r"z[- ]?score\s*(?:of|is|are|:|=)?\s*([0-9]+(?:\.[0-9]+)?)",
-                r"z\s*=\s*([0-9]+(?:\.[0-9]+)?)",
+                r"z[- ]?score\s*" + assign_op + r"?\s*([0-9]+(?:\.[0-9]+)?)",
+                r"z\s*" + assign_op + r"\s*([0-9]+(?:\.[0-9]+)?)",
             ],
         )
         if service_level is not None:
