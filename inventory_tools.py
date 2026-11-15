@@ -348,9 +348,6 @@ def calculate_quantity_discount(
         "AOC_j": "Annual Ordering Cost = (D / Q_feasible_j) * S ($/year)",
         "AHC_j": "Annual Holding Cost = (Q_feasible_j / 2) * H_j ($/year)",
         "TAC_j": "Total Annual Cost = APC_j + AOC_j + AHC_j ($/year)",
-        "N": "Replenishment order frequency = D / Q_feasible (orders/year)",
-        "Total_Units_Ordered": "Total cumulative units ordered to meet demand = N * Q_feasible = D (units)",
-        "Q_single": "Recommended order quantity if purchasing demand all at once = max(D, min_qty_j) (units)",
     }
 
     # Section 3: Formula (Symbolic)
@@ -363,8 +360,6 @@ def calculate_quantity_discount(
         "Annual Holding Cost": "AHC_j = (Q_feasible_j / 2) * H_j",
         "Total Annual Cost": "TAC_j = APC_j + AOC_j + AHC_j",
         "Optimal Decision": "Optimal Tier = argmin_j(TAC_j)",
-        "Demand Fulfillment Constraint": "Total Units Ordered = N * Q_batch >= D (Satisfies 100% of demand)",
-        "Single Procurement Order": "Q_single = max(D, min_qty_j) >= D",
     }
 
     # Deterministic Intermediate Calculations across tiers
@@ -445,19 +440,12 @@ def calculate_quantity_discount(
         f"min(TAC) = Tier {best_tier['tier_index']} at Q* = {best_tier['feasible_quantity']:,.1f} units with TAC = ${best_tier['total_annual_cost']:,.2f}"
     )
 
-    # Single order procurement quantity (must be at least demand AND at least tier minimum)
-    single_order_q = max(d, best_tier["min_qty"])
-    orders_per_year = d / best_tier["feasible_quantity"]
-
     # Section 5: Intermediate Calculations
     intermediate_calculations = {
         "evaluated_tiers": evaluated_tiers,
         "best_tier_index": best_tier["tier_index"],
         "optimal_feasible_quantity": best_tier["feasible_quantity"],
         "optimal_unit_price": best_tier["unit_price"],
-        "customer_demand": d,
-        "recommended_order_quantity": single_order_q,
-        "single_procurement_order_quantity": single_order_q,
         "annual_purchase_cost": best_tier["annual_purchase_cost"],
         "annual_ordering_cost": best_tier["annual_ordering_cost"],
         "annual_holding_cost": best_tier["annual_holding_cost"],
@@ -467,12 +455,10 @@ def calculate_quantity_discount(
     # Section 6: Final Answer
     final_answer = {
         "optimal_tier": best_tier["tier_index"],
-        "recommended_order_quantity": single_order_q,
-        "recommended_order_quantity_int": int(round(single_order_q)),
-        "optimal_unit_price": best_tier["unit_price"],
-        "customer_demand": d,
-        "single_procurement_order_quantity": single_order_q,
         "optimal_order_quantity": best_tier["feasible_quantity"],
+        "recommended_order_quantity": best_tier["feasible_quantity"],
+        "recommended_order_quantity_int": int(round(best_tier["feasible_quantity"])),
+        "optimal_unit_price": best_tier["unit_price"],
         "min_total_annual_cost": best_tier["total_annual_cost"],
     }
 
@@ -489,32 +475,24 @@ def calculate_quantity_discount(
             "passed": all(best_tier["total_annual_cost"] <= t["total_annual_cost"] + 1e-4 for t in evaluated_tiers),
             "details": f"Tier {best_tier['tier_index']} TAC (${best_tier['total_annual_cost']:,.2f}) <= all other evaluated tiers",
         },
-        {
-            "check": "Demand Satisfaction Constraint (Order Meets or Exceeds Demand)",
-            "passed": single_order_q >= d,
-            "details": f"Recommended order quantity ({single_order_q:,.0f} units) >= demand ({d:,.0f} units). "
-                       f"Order satisfies 100% of customer demand and qualifies for Tier {best_tier['tier_index']} pricing (minimum required: {best_tier['min_qty']:,.0f} units).",
-        },
     ]
 
     # Section 8: Assumptions
     assumptions = [
         "All-units quantity discount structure (the discounted price applies to every unit in the order batch).",
-        "Single order procurement satisfies at least the full customer demand in a single delivery batch.",
-        "Annual demand is deterministic and known in advance.",
-        "Supplier provides instantaneous fulfillment of the entire order with zero partial shipments.",
-        "The purchasing firm has adequate working capital and warehouse physical storage capacity to hold the order volume.",
-        "Zero deterioration, spoilage, or inventory shrinkage occurs when holding bulk order quantities.",
+        "Annual demand is deterministic, continuous, and identical across all discount brackets.",
+        "Supplier provides instantaneous batch fulfillment with zero partial shipments.",
+        "The purchasing firm has adequate working capital and warehouse physical storage capacity to hold bulk order volumes.",
+        "Zero deterioration, spoilage, or inventory shrinkage occurs when holding larger batch quantities.",
     ]
 
-    if single_order_q > d:
-        detail_msg = f" (exceeds demand of {round(d):,} units to qualify for the Tier {best_tier['tier_index']} discount minimum of {round(best_tier['min_qty']):,} units)"
-    else:
-        detail_msg = f" (fulfills 100% of the {round(d):,} unit demand and qualifies for Tier {best_tier['tier_index']})"
-
     recommendation = (
-        f"Order {round(single_order_q):,} units under Tier {best_tier['tier_index']} at ${best_tier['unit_price']:,.2f} per unit"
-        f"{detail_msg}, achieving the lowest total cost of ${best_tier['total_annual_cost']:,.2f}."
+        f"Select Tier {best_tier['tier_index']} with order batch of {round(best_tier['feasible_quantity']):,} units "
+        f"at ${best_tier['unit_price']:,.2f} per unit. "
+        f"This achieves the lowest total annual cost of ${best_tier['total_annual_cost']:,.2f} "
+        f"(Purchase: ${best_tier['annual_purchase_cost']:,.2f}, "
+        f"Ordering: ${best_tier['annual_ordering_cost']:,.2f}, "
+        f"Holding: ${best_tier['annual_holding_cost']:,.2f})."
     )
 
     return {
@@ -534,12 +512,9 @@ def calculate_quantity_discount(
         "step_by_step": steps,
         "results": {
             "optimal_tier": best_tier["tier_index"],
-            "recommended_order_quantity": single_order_q,
-            "recommended_order_quantity_int": int(round(single_order_q)),
-            "recommended_order_quantity_to_meet_demand": single_order_q,
-            "recommended_order_quantity_to_meet_demand_int": int(round(single_order_q)),
             "optimal_order_quantity": best_tier["feasible_quantity"],
-            "single_procurement_order_quantity": single_order_q,
+            "recommended_order_quantity": best_tier["feasible_quantity"],
+            "recommended_order_quantity_int": int(round(best_tier["feasible_quantity"])),
             "optimal_unit_price": best_tier["unit_price"],
             "min_total_annual_cost": best_tier["total_annual_cost"],
             "annual_purchase_cost": best_tier["annual_purchase_cost"],
